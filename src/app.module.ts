@@ -2,10 +2,11 @@ import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { ConfigModule } from '@nestjs/config';
-import { UserBotModule } from './modules//user-bot/userbot.module';
+import { UserBotModule } from './modules/user-bot/userbot.module';
+import { BotModule } from './modules/bot/bot.module';
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), UserBotModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), UserBotModule, BotModule],
   controllers: [AppController],
   providers: [AppService],
 })
