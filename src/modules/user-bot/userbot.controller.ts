@@ -5,7 +5,7 @@ import { UserBotService } from './userbot.service';
 export class UserBotController {
   constructor(private readonly userBotService: UserBotService) {}
 
-  // Brauzerda: http://localhost:3000/telegram/members?group=@guruh_nomi
+  // Brauzerda: http://localhost:3000/userbot/members?group=@guruh_nomi
   @Get('members')
   async getMembers(@Query('group') group: string) {
     if (!group) return { error: "Guruh username'ini kiriting" };

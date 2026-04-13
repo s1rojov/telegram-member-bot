@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
-import { UserBotService } from './telegram.service';
-import { TelegramController } from './telegram.controller';
+import { UserBotService } from './userbot.service';
+import { UserBotController } from './userbot.controller';
 
 @Module({
-  providers: [TelegramService],
-  exports: [TelegramService], // Boshqa modullar ishlata olishi uchun
-  controllers: [TelegramController],
+  providers: [UserBotService],
+  exports: [UserBotService], // Boshqa modullar ishlata olishi uchun
+  controllers: [UserBotController],
 })
-export class TelegramModule {}
+export class UserBotModule {}
