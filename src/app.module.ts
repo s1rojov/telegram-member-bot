@@ -1,13 +1,15 @@
 import { Module } from '@nestjs/common';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
 import { ConfigModule } from '@nestjs/config';
-import { UserBotModule } from './modules/user-bot/userbot.module';
-import { BotModule } from './modules/bot/bot.module';
+import { PrismaModule } from './modules/prisma/prisma.module';
+import { TelegramModule } from './modules/telegram/telegram.module';
+import { ForwarderModule } from './modules/forwarder/forwarder.module';
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), UserBotModule, BotModule],
-  controllers: [AppController],
-  providers: [AppService],
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true }),
+    PrismaModule,
+    TelegramModule,
+    ForwarderModule,
+  ],
 })
 export class AppModule {}
