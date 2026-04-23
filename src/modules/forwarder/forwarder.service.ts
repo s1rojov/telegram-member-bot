@@ -1,8 +1,9 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import translate from 'google-translate-api-next';
-import { Api } from 'telegram';
+import { Api, utils } from 'telegram';
 import { NewMessage, NewMessageEvent } from 'telegram/events';
+import { CustomFile } from 'telegram/client/uploads';
 import * as fs from 'fs';
 import * as path from 'path';
 import { TelegramService } from '../telegram/telegram.service';
@@ -270,12 +271,15 @@ export class ForwarderService implements OnModuleInit {
           this.translateText(message.message ?? '', message.id),
         ),
       );
+      const uploadFiles = await Promise.all(
+        messages.map((message) => this.downloadMediaAsUploadFile(message)),
+      );
 
       this.logger.log(
-        `Album copy rejimida yuborilmoqda: ${messages.length} ta`,
+        `Album fresh-upload rejimida yuborilmoqda: ${messages.length} ta`,
       );
       const result = await client.sendFile(this.destinationPeer, {
-        file: messages.map((message) => message.media as Api.TypeMessageMedia),
+        file: uploadFiles,
         caption: translatedCaptions,
         parseMode: false,
         silent: messages[0].silent,
@@ -306,8 +310,10 @@ export class ForwarderService implements OnModuleInit {
     );
 
     if (message.media && !(message.media instanceof Api.MessageMediaWebPage)) {
+      const uploadFile = await this.downloadMediaAsUploadFile(message);
+
       return client.sendFile(this.destinationPeer, {
-        file: message.media as Api.TypeMessageMedia,
+        file: uploadFile,
         caption: translatedText,
         parseMode: false,
         silent: message.silent,
@@ -322,6 +328,39 @@ export class ForwarderService implements OnModuleInit {
       linkPreview: message.media instanceof Api.MessageMediaWebPage,
       silent: message.silent,
     });
+  }
+
+  private async downloadMediaAsUploadFile(
+    message: Api.Message,
+  ): Promise<CustomFile> {
+    const client = this.telegramService.getClient();
+    const downloadedMedia = await client.downloadMedia(message, {});
+
+    if (!downloadedMedia || typeof downloadedMedia === 'string') {
+      throw new Error(`Media yuklab olinmadi: ${message.id}`);
+    }
+
+    const extension = this.getMediaExtension(message);
+    const fileName = `message-${message.id}${extension}`;
+
+    this.logger.log(`Media qayta upload uchun tayyorlandi: ${fileName}`);
+
+    return new CustomFile(
+      fileName,
+      downloadedMedia.length,
+      '',
+      downloadedMedia,
+    );
+  }
+
+  private getMediaExtension(message: Api.Message): string {
+    const rawExtension = utils.getExtension(message.media);
+
+    if (!rawExtension) {
+      return '.bin';
+    }
+
+    return rawExtension.startsWith('.') ? rawExtension : `.${rawExtension}`;
   }
 
   private async translateText(
