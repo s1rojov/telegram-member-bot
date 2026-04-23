@@ -1,16 +1,37 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { NewMessage, NewMessageEvent } from 'telegram/events';
-import { TelegramService } from '../telegram/telegram.service';
-import { PrismaService } from '../prisma/prisma.service';
+import translate from 'google-translate-api-next';
 import { Api } from 'telegram';
+import { NewMessage, NewMessageEvent } from 'telegram/events';
+import * as fs from 'fs';
+import * as path from 'path';
+import { TelegramService } from '../telegram/telegram.service';
+
+type ForwardRecord = {
+  sourceChannelId: string;
+  sourceMessageId: number;
+  destinationMessageId: number | null;
+  status: 'success' | 'failed';
+  error?: string;
+  forwardedAt: string;
+};
 
 @Injectable()
 export class ForwarderService implements OnModuleInit {
   private readonly logger = new Logger(ForwarderService.name);
-  /** Stored as strings for safe comparison with gramjs BigInteger IDs */
+  private readonly albumFlushDelayMs = 1200;
+  private readonly logFilePath = path.resolve(
+    process.cwd(),
+    'forwarded-ids.json',
+  );
+  private readonly translateClient = 'gtx';
+
   private sourceChannelIds: string[] = [];
-  private destinationChannelId: string = '';
+  private destinationChannelRef = '';
+  private destinationPeer: Api.TypeInputPeer | null = null;
+  private translateTo = 'uz';
+  private readonly forwardedKeys = new Set<string>();
+  private forwardHistory: ForwardRecord[] = [];
 
   // Album grouping: groupedId → { messages, timer }
   private albumBuffer = new Map<
@@ -18,17 +39,26 @@ export class ForwarderService implements OnModuleInit {
     { messages: Api.Message[]; timer: NodeJS.Timeout }
   >();
 
+  private readonly onNewMessageEvent = (event: NewMessageEvent): void => {
+    void this.handleNewMessage(event).catch((error: unknown) => {
+      this.logUnexpectedError('handleNewMessage xatosi', error);
+    });
+  };
+
   constructor(
     private readonly telegramService: TelegramService,
-    private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
   ) {}
 
-  async onModuleInit() {
+  async onModuleInit(): Promise<void> {
+    this.loadForwardHistory();
+
     const rawSourceIds =
       this.configService.get<string>('SOURCE_CHANNEL_IDS') ?? '';
     const rawDestId =
       this.configService.get<string>('DESTINATION_CHANNEL_ID') ?? '';
+    const rawTranslateTo =
+      this.configService.get<string>('TRANSLATE_TO')?.trim() ?? '';
 
     if (!rawSourceIds || !rawDestId) {
       this.logger.error(
@@ -37,130 +67,183 @@ export class ForwarderService implements OnModuleInit {
       return;
     }
 
-    this.destinationChannelId = rawDestId;
-    // Strip leading -100 and store bare channel IDs for comparison with gramjs IDs
+    if (rawTranslateTo) {
+      this.translateTo = rawTranslateTo;
+    }
+
+    this.destinationChannelRef = this.normalizeDestinationReference(rawDestId);
     this.sourceChannelIds = rawSourceIds
       .split(',')
       .map((id) => id.trim())
       .filter(Boolean)
-      .map((id) => id.replace(/^-100/, ''));
+      .map((id) => this.normalizeComparableChannelId(id));
 
     this.logger.log(
       `Kuzatilayotgan kanallar: ${this.sourceChannelIds.join(', ')}`,
     );
-    this.logger.log(`Maqsadli kanal: ${this.destinationChannelId}`);
+    this.logger.log(`Maqsadli kanal: ${this.destinationChannelRef}`);
+    this.logger.log(`Tarjima tili: ${this.translateTo}`);
 
     const client = this.telegramService.getClient();
 
-    client.addEventHandler(
-      (event: NewMessageEvent) => this.handleNewMessage(event),
-      new NewMessage({}),
-    );
+    try {
+      await client.getDialogs({ limit: 200 });
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Dialog cache yuklanmadi: ${this.getErrorMessage(error)}`,
+      );
+    }
+
+    await this.resolveDestinationPeer();
+
+    client.addEventHandler(this.onNewMessageEvent, new NewMessage({}));
 
     this.logger.log('Forwarder tayyor — yangi postlarni kutmoqda...');
   }
 
-  private async handleNewMessage(event: NewMessageEvent) {
-    const message = event.message as Api.Message;
-    if (!message || !message.peerId) return;
-
-    const peerId = message.peerId;
-    let channelIdStr: string | undefined;
-
-    if (peerId instanceof Api.PeerChannel) {
-      channelIdStr = peerId.channelId.toString();
-    } else if (peerId instanceof Api.PeerChat) {
-      channelIdStr = peerId.chatId.toString();
-    } else {
-      return; // Shaxsiy xabar — o'tkazib yuboramiz
+  private async handleNewMessage(event: NewMessageEvent): Promise<void> {
+    const { message } = event;
+    // console.log(message);
+    if (!(message instanceof Api.Message) || !message.peerId) {
+      return;
     }
 
-    const isFromSource = this.sourceChannelIds.includes(channelIdStr);
-    if (!isFromSource) return;
+    const sourceChannelId = this.extractComparableChannelId(message.peerId);
+    if (!sourceChannelId || !this.sourceChannelIds.includes(sourceChannelId)) {
+      return;
+    }
 
-    // Album (media group) tekshiruvi
+    if (this.isAlreadyForwarded(sourceChannelId, message.id)) {
+      this.logger.warn(
+        `Takror xabar o'tkazib yuborildi: ${sourceChannelId}:${message.id}`,
+      );
+      return;
+    }
+
     if (message.groupedId) {
-      await this.handleAlbumMessage(message, channelIdStr);
-    } else {
-      await this.forwardSingleMessage(message, channelIdStr);
+      this.bufferAlbumMessage(message, sourceChannelId);
+      return;
     }
+
+    await this.forwardMessages([message], sourceChannelId);
   }
 
-  private async handleAlbumMessage(
+  private bufferAlbumMessage(
     message: Api.Message,
-    sourceChannelIdStr: string,
-  ) {
-    const groupKey = message.groupedId!.toString();
+    sourceChannelId: string,
+  ): void {
+    const groupKey = `${sourceChannelId}:${message.groupedId?.toString()}`;
+    const existing = this.albumBuffer.get(groupKey);
 
-    if (this.albumBuffer.has(groupKey)) {
-      const existing = this.albumBuffer.get(groupKey)!;
+    if (existing) {
       clearTimeout(existing.timer);
-      existing.messages.push(message);
-      existing.timer = setTimeout(
-        () => this.flushAlbum(groupKey, sourceChannelIdStr),
-        500,
-      );
+      if (
+        !existing.messages.some(
+          (bufferedMessage) => bufferedMessage.id === message.id,
+        )
+      ) {
+        existing.messages.push(message);
+      }
+      existing.timer = this.scheduleAlbumFlush(groupKey, sourceChannelId);
     } else {
-      const timer = setTimeout(
-        () => this.flushAlbum(groupKey, sourceChannelIdStr),
-        500,
-      );
+      const timer = this.scheduleAlbumFlush(groupKey, sourceChannelId);
       this.albumBuffer.set(groupKey, { messages: [message], timer });
     }
   }
 
-  private async flushAlbum(groupKey: string, sourceChannelIdStr: string) {
-    const buffered = this.albumBuffer.get(groupKey);
-    this.albumBuffer.delete(groupKey);
-    if (!buffered || buffered.messages.length === 0) return;
-
-    const messages = buffered.messages.sort((a, b) => a.id - b.id);
-    const firstMessage = messages[0];
-    const messageIds = messages.map((m) => m.id);
-
-    this.logger.log(
-      `Album yuborilmoqda (${messages.length} ta rasm) — kanal: ${sourceChannelIdStr}`,
-    );
-
-    await this.forwardMessages(firstMessage, messageIds, sourceChannelIdStr);
+  private scheduleAlbumFlush(
+    groupKey: string,
+    sourceChannelId: string,
+  ): NodeJS.Timeout {
+    return setTimeout(() => {
+      void this.flushAlbum(groupKey, sourceChannelId);
+    }, this.albumFlushDelayMs);
   }
 
-  private async forwardSingleMessage(
-    message: Api.Message,
-    sourceChannelIdStr: string,
-  ) {
-    this.logger.log(
-      `Post yuborilmoqda — kanal: ${sourceChannelIdStr}, xabar ID: ${message.id}`,
+  private async flushAlbum(
+    groupKey: string,
+    sourceChannelId: string,
+  ): Promise<void> {
+    const buffered = this.albumBuffer.get(groupKey);
+    this.albumBuffer.delete(groupKey);
+    if (!buffered || buffered.messages.length === 0) {
+      return;
+    }
+
+    const messages = [...buffered.messages]
+      .sort((left, right) => left.id - right.id)
+      .filter(
+        (message, index, items) =>
+          index === items.findIndex((item) => item.id === message.id),
+      );
+    const pendingMessages = messages.filter(
+      (message) => !this.isAlreadyForwarded(sourceChannelId, message.id),
     );
-    await this.forwardMessages(message, [message.id], sourceChannelIdStr);
+
+    if (pendingMessages.length === 0) {
+      this.logger.warn(`Album o'tkazib yuborildi: ${groupKey}`);
+      return;
+    }
+
+    this.logger.log(
+      `Album yuborilmoqda (${pendingMessages.length} ta xabar) — kanal: ${sourceChannelId}`,
+    );
+
+    await this.forwardMessages(pendingMessages, sourceChannelId);
   }
 
   private async forwardMessages(
-    referenceMessage: Api.Message,
-    messageIds: number[],
-    sourceChannelIdStr: string,
-  ) {
-    const client = this.telegramService.getClient();
+    messages: Api.Message[],
+    sourceChannelId: string,
+  ): Promise<void> {
+    const pendingMessages = messages.filter(
+      (message) => !this.isAlreadyForwarded(sourceChannelId, message.id),
+    );
+
+    if (pendingMessages.length === 0) {
+      return;
+    }
+
+    if (!this.destinationPeer) {
+      await this.resolveDestinationPeer();
+    }
+
+    if (!this.destinationPeer) {
+      const errorMessage =
+        'Maqsadli kanal resolve qilinmadi. Kanalni shu akkaunt bilan oching yoki public username ishlating.';
+      this.logger.error(errorMessage);
+
+      for (const message of pendingMessages) {
+        this.recordForwardAttempt({
+          sourceChannelId,
+          sourceMessageId: message.id,
+          destinationMessageId: null,
+          status: 'failed',
+          error: errorMessage,
+          forwardedAt: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
+    const messageIds = pendingMessages.map((message) => message.id);
+    this.logger.log(
+      `Copy boshlanmoqda — kanal: ${sourceChannelId}, xabarlar: ${messageIds.join(', ')}`,
+    );
 
     try {
-      // client.forwardMessages() handles randomId internally
-      const result = await client.forwardMessages(this.destinationChannelId, {
-        messages: messageIds,
-        fromPeer: referenceMessage.peerId!,
-      });
+      const result = await this.sendMessagesAsCopies(pendingMessages);
 
-      // Yuborilgan xabar ID larini olish
-      const sentMessages = Array.isArray(result) ? result : [result];
+      const sentMessages = this.normalizeForwardResult(result);
 
       for (let i = 0; i < messageIds.length; i++) {
-        const sentMsg = sentMessages[i] as Api.Message | undefined;
-        await this.prisma.forwardLog.create({
-          data: {
-            sourceChannelId: sourceChannelIdStr,
-            sourceMessageId: BigInt(messageIds[i]),
-            destinationMessageId: sentMsg?.id ? BigInt(sentMsg.id) : null,
-            status: 'success',
-          },
+        const sentMessage = sentMessages[i];
+        this.recordForwardAttempt({
+          sourceChannelId,
+          sourceMessageId: messageIds[i],
+          destinationMessageId: sentMessage?.id ?? null,
+          status: 'success',
+          forwardedAt: new Date().toISOString(),
         });
       }
 
@@ -168,24 +251,130 @@ export class ForwarderService implements OnModuleInit {
         `✓ ${messageIds.length} ta xabar muvaffaqiyatli yuborildi`,
       );
     } catch (error: any) {
-      await this.handleForwardError(
-        error,
-        referenceMessage,
-        messageIds,
-        sourceChannelIdStr,
+      await this.handleForwardError(error, pendingMessages, sourceChannelId);
+    }
+  }
+
+  private async sendMessagesAsCopies(
+    messages: Api.Message[],
+  ): Promise<Api.Message | Array<Api.Message | undefined>> {
+    const client = this.telegramService.getClient();
+
+    if (!this.destinationPeer) {
+      throw new Error('Destination peer topilmadi');
+    }
+
+    if (messages.length > 1 && messages.every((message) => message.media)) {
+      const translatedCaptions = await Promise.all(
+        messages.map((message) =>
+          this.translateText(message.message ?? '', message.id),
+        ),
       );
+
+      this.logger.log(
+        `Album copy rejimida yuborilmoqda: ${messages.length} ta`,
+      );
+      const result = await client.sendFile(this.destinationPeer, {
+        file: messages.map((message) => message.media as Api.TypeMessageMedia),
+        caption: translatedCaptions,
+        parseMode: false,
+        silent: messages[0].silent,
+      });
+
+      return this.normalizeForwardResult(result);
+    }
+
+    const sentMessages = await Promise.all(
+      messages.map((message) => this.sendSingleMessageAsCopy(message)),
+    );
+
+    return sentMessages;
+  }
+
+  private async sendSingleMessageAsCopy(
+    message: Api.Message,
+  ): Promise<Api.Message> {
+    const client = this.telegramService.getClient();
+
+    if (!this.destinationPeer) {
+      throw new Error('Destination peer topilmadi');
+    }
+
+    const translatedText = await this.translateText(
+      message.message ?? '',
+      message.id,
+    );
+
+    if (message.media && !(message.media instanceof Api.MessageMediaWebPage)) {
+      return client.sendFile(this.destinationPeer, {
+        file: message.media as Api.TypeMessageMedia,
+        caption: translatedText,
+        parseMode: false,
+        silent: message.silent,
+      });
+    }
+
+    const textToSend = translatedText || message.message || ' ';
+
+    return client.sendMessage(this.destinationPeer, {
+      message: textToSend,
+      parseMode: false,
+      linkPreview: message.media instanceof Api.MessageMediaWebPage,
+      silent: message.silent,
+    });
+  }
+
+  private async translateText(
+    text: string,
+    sourceMessageId: number,
+  ): Promise<string> {
+    if (!text.trim()) {
+      return text;
+    }
+
+    this.logger.log(
+      `Tarjima qilinmoqda — xabar ID: ${sourceMessageId}, til: ${this.translateTo}`,
+    );
+
+    try {
+      const result = await translate(text, {
+        to: this.translateTo,
+        client: this.translateClient,
+      });
+
+      if (
+        Array.isArray(result) ||
+        typeof result !== 'object' ||
+        result === null ||
+        !('text' in result) ||
+        typeof result.text !== 'string'
+      ) {
+        return text;
+      }
+
+      const translatedText = result.text.trim();
+      if (!translatedText) {
+        return text;
+      }
+
+      this.logger.log(`Tarjima tayyor — xabar ID: ${sourceMessageId}`);
+      return translatedText;
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Tarjima xatosi — xabar ID: ${sourceMessageId}: ${this.getErrorMessage(error)}`,
+      );
+      return text;
     }
   }
 
   private async handleForwardError(
     error: any,
-    referenceMessage: Api.Message,
-    messageIds: number[],
-    sourceChannelIdStr: string,
-  ) {
+    messages: Api.Message[],
+    sourceChannelId: string,
+  ): Promise<void> {
     const errorName: string = error?.constructor?.name ?? 'UnknownError';
+    const errorMessage = this.getErrorMessage(error);
 
-    // FloodWaitError — kutib, qayta urinish
     if (errorName === 'FloodWaitError' && typeof error.seconds === 'number') {
       const waitSeconds: number = error.seconds;
       this.logger.warn(`FloodWait: ${waitSeconds} soniya kutilmoqda...`);
@@ -195,31 +384,250 @@ export class ForwarderService implements OnModuleInit {
       );
 
       this.logger.log('FloodWait tugadi. Qayta urinilmoqda...');
-      try {
-        await this.forwardMessages(
-          referenceMessage,
-          messageIds,
-          sourceChannelIdStr,
-        );
-        return;
-      } catch (retryError: any) {
-        this.logger.error('Qayta urinishda ham xato:', retryError.message);
-      }
-    } else {
-      this.logger.error(`Xabar yuborishda xato [${errorName}]:`, error.message);
+      await this.forwardMessages(messages, sourceChannelId);
+      return;
     }
 
-    // Xatolikni DB ga yozish
-    for (const msgId of messageIds) {
-      await this.prisma.forwardLog.create({
-        data: {
-          sourceChannelId: sourceChannelIdStr,
-          sourceMessageId: BigInt(msgId),
-          destinationMessageId: null,
-          status: 'failed',
-          error: `${errorName}: ${error.message ?? ''}`.slice(0, 500),
-        },
+    this.logger.error(`Xabar yuborishda xato [${errorName}]: ${errorMessage}`);
+
+    const hint = this.buildErrorHint(errorMessage);
+    if (hint) {
+      this.logger.error(`Yechim: ${hint}`);
+    }
+
+    for (const message of messages) {
+      this.recordForwardAttempt({
+        sourceChannelId,
+        sourceMessageId: message.id,
+        destinationMessageId: null,
+        status: 'failed',
+        error: `${errorName}: ${errorMessage}`.slice(0, 500),
+        forwardedAt: new Date().toISOString(),
       });
     }
+  }
+
+  private async resolveDestinationPeer(): Promise<void> {
+    const client = this.telegramService.getClient();
+
+    try {
+      this.destinationPeer = await client.getInputEntity(
+        this.destinationChannelRef,
+      );
+      const destinationEntity = await client.getEntity(this.destinationPeer);
+      this.logger.log(
+        `Destination resolve bo'ldi: ${this.describeEntity(destinationEntity)}`,
+      );
+    } catch (error: unknown) {
+      this.destinationPeer = null;
+      this.logger.error(
+        `Maqsadli kanal resolve bo'lmadi (${this.destinationChannelRef}): ${this.getErrorMessage(error)}`,
+      );
+
+      const hint = this.buildErrorHint(this.getErrorMessage(error));
+      if (hint) {
+        this.logger.error(`Yechim: ${hint}`);
+      }
+    }
+  }
+
+  private loadForwardHistory(): void {
+    if (!fs.existsSync(this.logFilePath)) {
+      return;
+    }
+
+    try {
+      const raw = fs.readFileSync(this.logFilePath, 'utf-8');
+      const parsed = JSON.parse(raw) as ForwardRecord[];
+      this.forwardHistory = Array.isArray(parsed) ? parsed : [];
+
+      for (const entry of this.forwardHistory) {
+        if (entry.status === 'success') {
+          this.forwardedKeys.add(
+            this.makeForwardKey(entry.sourceChannelId, entry.sourceMessageId),
+          );
+        }
+      }
+
+      this.logger.log(
+        `Avvalgi ${this.forwardedKeys.size} ta forward ID yuklandi`,
+      );
+    } catch (error: unknown) {
+      this.forwardHistory = [];
+      this.forwardedKeys.clear();
+      this.logger.warn(
+        `forwarded-ids.json o'qishda xato: ${this.getErrorMessage(error)}`,
+      );
+    }
+  }
+
+  private recordForwardAttempt(record: ForwardRecord): void {
+    this.forwardHistory.push(record);
+
+    if (record.status === 'success') {
+      this.forwardedKeys.add(
+        this.makeForwardKey(record.sourceChannelId, record.sourceMessageId),
+      );
+    }
+
+    try {
+      fs.writeFileSync(
+        this.logFilePath,
+        JSON.stringify(this.forwardHistory, null, 2),
+        'utf-8',
+      );
+    } catch (error: unknown) {
+      this.logger.error(
+        `forwarded-ids.json yozishda xato: ${this.getErrorMessage(error)}`,
+      );
+    }
+  }
+
+  private normalizeDestinationReference(rawValue: string): string {
+    const value = rawValue.trim();
+    if (!value) {
+      throw new Error("DESTINATION_CHANNEL_ID bo'sh");
+    }
+
+    if (value.startsWith('@') || value.includes('t.me/')) {
+      return value;
+    }
+
+    if (/^-100\d+$/.test(value) || /^-\d+$/.test(value)) {
+      return value;
+    }
+
+    if (/^100\d+$/.test(value)) {
+      return `-${value}`;
+    }
+
+    if (/^\d+$/.test(value)) {
+      return `-100${value}`;
+    }
+
+    throw new Error(`DESTINATION_CHANNEL_ID noto'g'ri: ${value}`);
+  }
+
+  private normalizeComparableChannelId(rawValue: string): string {
+    const value = rawValue.trim();
+    const normalized = value.replace(/^-100/, '').replace(/^-/, '');
+
+    if (!/^\d+$/.test(normalized)) {
+      throw new Error(`SOURCE_CHANNEL_IDS noto'g'ri: ${value}`);
+    }
+
+    if (/^100\d+$/.test(value)) {
+      return value.slice(3);
+    }
+
+    return normalized;
+  }
+
+  private extractComparableChannelId(peerId: Api.TypePeer): string | null {
+    if (peerId instanceof Api.PeerChannel) {
+      return peerId.channelId.toString();
+    }
+
+    if (peerId instanceof Api.PeerChat) {
+      return peerId.chatId.toString();
+    }
+
+    return null;
+  }
+
+  private isAlreadyForwarded(
+    sourceChannelId: string,
+    sourceMessageId: number,
+  ): boolean {
+    return this.forwardedKeys.has(
+      this.makeForwardKey(sourceChannelId, sourceMessageId),
+    );
+  }
+
+  private makeForwardKey(
+    sourceChannelId: string,
+    sourceMessageId: number,
+  ): string {
+    return `${sourceChannelId}:${sourceMessageId}`;
+  }
+
+  private normalizeForwardResult(
+    result: unknown,
+  ): Array<Api.Message | undefined> {
+    if (!Array.isArray(result)) {
+      return result instanceof Api.Message ? [result] : [];
+    }
+
+    return result.flatMap((item) => {
+      if (Array.isArray(item)) {
+        return item.filter(
+          (message): message is Api.Message => message instanceof Api.Message,
+        );
+      }
+
+      return item instanceof Api.Message ? [item] : [undefined];
+    });
+  }
+
+  private describeEntity(entity: unknown): string {
+    if (entity instanceof Api.Channel || entity instanceof Api.Chat) {
+      return `${entity.title} (${entity.id.toString()})`;
+    }
+
+    if (entity instanceof Api.User) {
+      return `${entity.firstName ?? 'User'} (${entity.id.toString()})`;
+    }
+
+    return 'UnknownEntity';
+  }
+
+  private buildErrorHint(errorMessage: string): string | null {
+    const normalizedMessage = errorMessage.toUpperCase();
+
+    if (
+      normalizedMessage.includes('CHAT_WRITE_FORBIDDEN') ||
+      normalizedMessage.includes('CHAT_ADMIN_REQUIRED')
+    ) {
+      return "Userbot account destination kanalda admin bo'lishi yoki post yozish huquqiga ega bo'lishi kerak.";
+    }
+
+    if (normalizedMessage.includes('CHANNEL_PRIVATE')) {
+      return "Userbot account source va destination private kanallarga a'zo bo'lishi kerak.";
+    }
+
+    if (
+      normalizedMessage.includes('PEER_ID_INVALID') ||
+      normalizedMessage.includes('INPUT ENTITY') ||
+      normalizedMessage.includes('CANNOT FIND ANY ENTITY')
+    ) {
+      return "Kanal ID yoki username noto'g'ri bo'lishi mumkin. Destination kanalni shu akkaunt bilan oching yoki public @username ishlating.";
+    }
+
+    if (normalizedMessage.includes('USER_BANNED_IN_CHANNEL')) {
+      return 'Userbot account kanalda ban qilingan. Boshqa account yoki ruxsat kerak.';
+    }
+
+    return null;
+  }
+
+  private getErrorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    if (typeof error === 'string') {
+      return error;
+    }
+
+    return "Noma'lum xato";
+  }
+
+  private logUnexpectedError(context: string, error: unknown): void {
+    if (error instanceof Error) {
+      this.logger.error(`${context}: ${error.message}`, error.stack);
+      return;
+    }
+
+    this.logger.error(`${context}: ${this.getErrorMessage(error)}`);
   }
 }
