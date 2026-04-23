@@ -21,10 +21,7 @@ type ForwardRecord = {
 export class ForwarderService implements OnModuleInit {
   private readonly logger = new Logger(ForwarderService.name);
   private readonly albumFlushDelayMs = 1200;
-  private readonly logFilePath = path.resolve(
-    process.cwd(),
-    'forwarded-ids.json',
-  );
+  private readonly logFilePath: string;
   private readonly translateClient = 'gtx';
 
   private sourceChannelIds: string[] = [];
@@ -49,7 +46,12 @@ export class ForwarderService implements OnModuleInit {
   constructor(
     private readonly telegramService: TelegramService,
     private readonly configService: ConfigService,
-  ) {}
+  ) {
+    this.logFilePath = path.resolve(
+      this.configService.get<string>('FORWARDED_IDS_PATH')?.trim() ||
+        'forwarded-ids.json',
+    );
+  }
 
   async onModuleInit(): Promise<void> {
     this.loadForwardHistory();

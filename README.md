@@ -44,6 +44,34 @@ $ npm run start:dev
 $ npm run start:prod
 ```
 
+## Docker
+
+This bot runs as a background worker, so you do not need to publish any port.
+
+Build the image:
+
+```bash
+docker build -t telegram-member-bot .
+```
+
+Run it with your local `.env` file:
+
+```bash
+docker run --name telegram-member-bot --env-file .env -v telegram-member-bot-data:/app/data telegram-member-bot
+```
+
+If `TELEGRAM_SESSION` is still empty and you need to enter the Telegram login code manually, start the first run in interactive mode:
+
+```bash
+docker run -it --rm --env-file .env -v telegram-member-bot-data:/app/data telegram-member-bot
+```
+
+After the first login, copy the printed session string into `.env` as `TELEGRAM_SESSION`. Then you can run the container normally, including detached mode:
+
+```bash
+docker run -d --name telegram-member-bot --restart unless-stopped --env-file .env -v telegram-member-bot-data:/app/data telegram-member-bot
+```
+
 ## Run tests
 
 ```bash
