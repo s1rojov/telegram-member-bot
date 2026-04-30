@@ -364,7 +364,15 @@ export class ForwarderService implements OnModuleInit {
 
     return rawExtension.startsWith('.') ? rawExtension : `.${rawExtension}`;
   }
+  private removeChannelLinks(text: string): string {
+    if (!text) return text;
 
+    // Xabar oxiridagi @username larni topish (va ulardan keyingi bo'shliqlarni)
+    // Bu regex faqat xabar oxiridagi qatorlarda kelgan @belgilarni o'chiradi
+    const cleanedText = text.replace(/(@[a-zA-Z0-9_]+\s*)+$/g, '');
+
+    return cleanedText.trim();
+  }
   private async translateText(
     text: string,
     sourceMessageId: number,
@@ -373,12 +381,21 @@ export class ForwarderService implements OnModuleInit {
       return text;
     }
 
+    // 1. Avval kanal linklarini (oxiridagilarini) o'chirib tashlaymiz
+    const cleanOriginalText = this.removeChannelLinks(text);
+
+    // Agar linklar o'chgandan keyin matn bo'sh bo'lib qolsa (faqat link bo'lgan bo'lsa)
+    if (!cleanOriginalText.trim()) {
+      return '';
+    }
+
     this.logger.log(
       `Tarjima qilinmoqda — xabar ID: ${sourceMessageId}, til: ${this.translateTo}`,
     );
 
     try {
-      const result = await translate(text, {
+      const result = await translate(cleanOriginalText, {
+        // Tozalangan matnni yuboramiz
         to: this.translateTo,
         client: this.translateClient,
       });
@@ -390,21 +407,25 @@ export class ForwarderService implements OnModuleInit {
         !('text' in result) ||
         typeof result.text !== 'string'
       ) {
-        return text;
+        return cleanOriginalText; // Xato bo'lsa tozalanganini qaytaramiz
       }
 
       const translatedText = result.text.trim();
       if (!translatedText) {
-        return text;
+        return cleanOriginalText;
       }
 
+      // 2. Tarjima qilingan matnning oxirida ham ba'zan link qolib ketishi mumkin
+      // (tarjimon xatosi tufayli), yana bir bor tekshirib yuboramiz
+      const finalResult = this.removeChannelLinks(translatedText);
+
       this.logger.log(`Tarjima tayyor — xabar ID: ${sourceMessageId}`);
-      return translatedText;
+      return finalResult;
     } catch (error: unknown) {
       this.logger.warn(
         `Tarjima xatosi — xabar ID: ${sourceMessageId}: ${this.getErrorMessage(error)}`,
       );
-      return text;
+      return cleanOriginalText;
     }
   }
 
