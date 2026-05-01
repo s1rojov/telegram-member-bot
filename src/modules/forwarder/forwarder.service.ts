@@ -82,7 +82,7 @@ export class ForwarderService implements OnModuleInit {
       .map((id) => this.normalizeComparableChannelId(id));
 
     this.logger.log(
-      `Kuzatilayotgan kanallar: ${this.sourceChannelIds.join(', ')}`,
+      `Kuzatilayotgan kanal IDlari: ${this.sourceChannelIds.join(', ')}`,
     );
     this.logger.log(`Maqsadli kanal: ${this.destinationChannelRef}`);
     this.logger.log(`Tarjima tili: ${this.translateTo}`);
@@ -98,11 +98,52 @@ export class ForwarderService implements OnModuleInit {
     }
 
     await this.resolveDestinationPeer();
+    await this.resolveSourceChannelNames();
 
     client.addEventHandler(this.onNewMessageEvent, new NewMessage({}));
 
     this.logger.log('Forwarder tayyor — yangi postlarni kutmoqda...');
   }
+
+  // ── Source kanallarni resolve qilib cache ga yuklaydi ───────────────────────
+  private async resolveSourceChannelNames(): Promise<void> {
+    const client = this.telegramService.getClient();
+
+    this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    this.logger.log(
+      `Kuzatilayotgan kanallar (${this.sourceChannelIds.length} ta):`,
+    );
+
+    for (const channelId of this.sourceChannelIds) {
+      const resolveRef = `-100${channelId}`;
+      try {
+        // GetFullChannel → entity cache ga tushadi, keyingi resolve lar ishlaydi
+        const fullChannel = await client.invoke(
+          new Api.channels.GetFullChannel({
+            channel: resolveRef,
+          }),
+        );
+
+        const chat = fullChannel.chats?.[0];
+        const name =
+          chat instanceof Api.Channel || chat instanceof Api.Chat
+            ? chat.title
+            : "Noma'lum";
+
+        this.logger.log(`  ✓ ${name} (ID: ${channelId})`);
+      } catch (error: unknown) {
+        this.logger.warn(
+          `  ✗ ID: ${channelId} — resolve bo'lmadi: ${this.getErrorMessage(error)}`,
+        );
+        this.logger.warn(
+          `    Maslahat: .env da ID o'rniga @username ishlating`,
+        );
+      }
+    }
+
+    this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  }
+  // ────────────────────────────────────────────────────────────────────────────
 
   private async handleNewMessage(event: NewMessageEvent): Promise<void> {
     const { message } = event;
@@ -364,15 +405,15 @@ export class ForwarderService implements OnModuleInit {
 
     return rawExtension.startsWith('.') ? rawExtension : `.${rawExtension}`;
   }
+
   private removeChannelLinks(text: string): string {
     if (!text) return text;
 
-    // Xabar oxiridagi @username larni topish (va ulardan keyingi bo'shliqlarni)
-    // Bu regex faqat xabar oxiridagi qatorlarda kelgan @belgilarni o'chiradi
     const cleanedText = text.replace(/(@[a-zA-Z0-9_]+\s*)+$/g, '');
 
     return cleanedText.trim();
   }
+
   private async translateText(
     text: string,
     sourceMessageId: number,
@@ -381,10 +422,8 @@ export class ForwarderService implements OnModuleInit {
       return text;
     }
 
-    // 1. Avval kanal linklarini (oxiridagilarini) o'chirib tashlaymiz
     const cleanOriginalText = this.removeChannelLinks(text);
 
-    // Agar linklar o'chgandan keyin matn bo'sh bo'lib qolsa (faqat link bo'lgan bo'lsa)
     if (!cleanOriginalText.trim()) {
       return '';
     }
@@ -395,7 +434,6 @@ export class ForwarderService implements OnModuleInit {
 
     try {
       const result = await translate(cleanOriginalText, {
-        // Tozalangan matnni yuboramiz
         to: this.translateTo,
         client: this.translateClient,
       });
@@ -407,7 +445,7 @@ export class ForwarderService implements OnModuleInit {
         !('text' in result) ||
         typeof result.text !== 'string'
       ) {
-        return cleanOriginalText; // Xato bo'lsa tozalanganini qaytaramiz
+        return cleanOriginalText;
       }
 
       const translatedText = result.text.trim();
@@ -415,8 +453,6 @@ export class ForwarderService implements OnModuleInit {
         return cleanOriginalText;
       }
 
-      // 2. Tarjima qilingan matnning oxirida ham ba'zan link qolib ketishi mumkin
-      // (tarjimon xatosi tufayli), yana bir bor tekshirib yuboramiz
       const finalResult = this.removeChannelLinks(translatedText);
 
       this.logger.log(`Tarjima tayyor — xabar ID: ${sourceMessageId}`);
@@ -478,7 +514,7 @@ export class ForwarderService implements OnModuleInit {
       );
       const destinationEntity = await client.getEntity(this.destinationPeer);
       this.logger.log(
-        `Destination resolve bo'ldi: ${this.describeEntity(destinationEntity)}`,
+        `Maqsadli kanal: ${this.describeEntity(destinationEntity)}`,
       );
     } catch (error: unknown) {
       this.destinationPeer = null;
@@ -633,11 +669,11 @@ export class ForwarderService implements OnModuleInit {
 
   private describeEntity(entity: unknown): string {
     if (entity instanceof Api.Channel || entity instanceof Api.Chat) {
-      return `${entity.title} (${entity.id.toString()})`;
+      return `${entity.title} (ID: ${entity.id.toString()})`;
     }
 
     if (entity instanceof Api.User) {
-      return `${entity.firstName ?? 'User'} (${entity.id.toString()})`;
+      return `${entity.firstName ?? 'User'} (ID: ${entity.id.toString()})`;
     }
 
     return 'UnknownEntity';
