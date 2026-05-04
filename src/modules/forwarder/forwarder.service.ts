@@ -37,6 +37,11 @@ export class ForwarderService implements OnModuleInit {
     { messages: Api.Message[]; timer: NodeJS.Timeout }
   >();
 
+  // Polling mexanizmi uchun
+  private readonly pollingIntervalMs = 60000; // 1 daqiqa
+  private pollingTimer: NodeJS.Timeout | null = null;
+  private lastCheckedMessageIds = new Map<string, number>(); // channelId -> lastMessageId
+
   private readonly onNewMessageEvent = (event: NewMessageEvent): void => {
     void this.handleNewMessage(event).catch((error: unknown) => {
       this.logUnexpectedError('handleNewMessage xatosi', error);
@@ -102,10 +107,16 @@ export class ForwarderService implements OnModuleInit {
     await this.resolveDestinationPeer();
     await this.resolveSourceChannelNames();
 
+    // Har bir kanal uchun oxirgi xabar ID ni olish
+    await this.initializeLastMessageIds();
+
     // Barcha xabar turlarini eshitish uchun
     client.addEventHandler(this.onNewMessageEvent, new NewMessage({}));
 
-    this.logger.log('Forwarder tayyor — yangi postlarni kutmoqda...');
+    // Polling mexanizmini ishga tushirish
+    this.startPolling();
+
+    this.logger.log('Forwarder tayyor — yangi postlarni kutmoqda (event + polling)...');
   }
 
   // ── Source kanallarni resolve qilib cache ga yuklaydi ───────────────────────
@@ -153,6 +164,128 @@ export class ForwarderService implements OnModuleInit {
   }
   // ────────────────────────────────────────────────────────────────────────────
 
+  // ── Boshlang'ich holatni o'rnatish ─────────────────────────────────────────
+  private async initializeLastMessageIds(): Promise<void> {
+    const client = this.telegramService.getClient();
+
+    this.logger.log('Har bir kanal uchun oxirgi xabar ID ni olish...');
+
+    for (const channelId of this.sourceChannelIds) {
+      try {
+        const resolveRef = `-100${channelId}`;
+        const entity = await client.getEntity(resolveRef);
+
+        // Oxirgi xabarni olish
+        const messages = await client.getMessages(entity, { limit: 1 });
+
+        if (messages && messages.length > 0 && messages[0] instanceof Api.Message) {
+          const lastMessageId = messages[0].id;
+          this.lastCheckedMessageIds.set(channelId, lastMessageId);
+          this.logger.log(`  ✓ Kanal ${channelId}: oxirgi xabar ID = ${lastMessageId}`);
+        }
+      } catch (error: unknown) {
+        this.logger.warn(
+          `  ✗ Kanal ${channelId}: oxirgi xabar ID olinmadi: ${this.getErrorMessage(error)}`
+        );
+      }
+    }
+
+    this.logger.log('Boshlang\'ich holatni o\'rnatish tugadi');
+  }
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // ── Polling mexanizmi ───────────────────────────────────────────────────────
+  private startPolling(): void {
+    this.logger.log(`Polling mexanizmi ishga tushirildi (interval: ${this.pollingIntervalMs / 1000}s)`);
+
+    // Dastlabki tekshiruv
+    void this.pollChannels().catch((error: unknown) => {
+      this.logUnexpectedError('Polling dastlabki tekshiruv xatosi', error);
+    });
+
+    // Muntazam tekshiruvlar
+    this.pollingTimer = setInterval(() => {
+      void this.pollChannels().catch((error: unknown) => {
+        this.logUnexpectedError('Polling xatosi', error);
+      });
+    }, this.pollingIntervalMs);
+  }
+
+  private async pollChannels(): Promise<void> {
+    const client = this.telegramService.getClient();
+
+    for (const channelId of this.sourceChannelIds) {
+      try {
+        const resolveRef = `-100${channelId}`;
+        const entity = await client.getEntity(resolveRef);
+
+        // Oxirgi xabarlarni olish (limit: 10)
+        const messages = await client.getMessages(entity, { limit: 10 });
+
+        if (!messages || messages.length === 0) {
+          continue;
+        }
+
+        // Oxirgi tekshirilgan message ID ni olish
+        const lastCheckedId = this.lastCheckedMessageIds.get(channelId) || 0;
+
+        // Yangi xabarlarni filtrlash
+        const newMessages = messages.filter(
+          (msg) => msg instanceof Api.Message && msg.id > lastCheckedId
+        ) as Api.Message[];
+
+        if (newMessages.length > 0) {
+          this.logger.log(
+            `Polling: ${newMessages.length} ta yangi xabar topildi — kanal: ${channelId}`
+          );
+
+          // Eng yangi message ID ni saqlash
+          const maxId = Math.max(...newMessages.map((msg) => msg.id));
+          this.lastCheckedMessageIds.set(channelId, maxId);
+
+          // Xabarlarni qayta ishlash (eskidan yangiga)
+          const sortedMessages = [...newMessages].sort((a, b) => a.id - b.id);
+
+          for (const message of sortedMessages) {
+            // Agar allaqachon forward qilingan bo'lsa, o'tkazib yuborish
+            if (this.isAlreadyForwarded(channelId, message.id)) {
+              continue;
+            }
+
+            // Album xabarlarini guruhlash
+            if (message.groupedId) {
+              this.bufferAlbumMessage(message, channelId);
+            } else {
+              await this.forwardMessages([message], channelId);
+            }
+          }
+        } else {
+          // Oxirgi message ID ni yangilash (agar yangi xabar bo'lmasa ham)
+          if (messages.length > 0 && messages[0] instanceof Api.Message) {
+            const latestId = messages[0].id;
+            const currentLastChecked = this.lastCheckedMessageIds.get(channelId) || 0;
+            if (latestId > currentLastChecked) {
+              this.lastCheckedMessageIds.set(channelId, latestId);
+            }
+          }
+        }
+      } catch (error: unknown) {
+        this.logger.warn(
+          `Polling xatosi — kanal: ${channelId}: ${this.getErrorMessage(error)}`
+        );
+      }
+    }
+  }
+
+  private stopPolling(): void {
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
+      this.logger.log('Polling mexanizmi to\'xtatildi');
+    }
+  }
+  // ────────────────────────────────────────────────────────────────────────────
+
   private async handleNewMessage(event: NewMessageEvent): Promise<void> {
     const { message } = event;
 
@@ -186,6 +319,12 @@ export class ForwarderService implements OnModuleInit {
         `Takror xabar o'tkazib yuborildi: ${sourceChannelId}:${message.id}`,
       );
       return;
+    }
+
+    // Oxirgi tekshirilgan message ID ni yangilash
+    const currentLastChecked = this.lastCheckedMessageIds.get(sourceChannelId) || 0;
+    if (message.id > currentLastChecked) {
+      this.lastCheckedMessageIds.set(sourceChannelId, message.id);
     }
 
     this.logger.log(
