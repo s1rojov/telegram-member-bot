@@ -90,7 +90,9 @@ export class ForwarderService implements OnModuleInit {
     const client = this.telegramService.getClient();
 
     try {
-      await client.getDialogs({ limit: 200 });
+      // Barcha dialoglarni yuklash uchun limit oshirildi
+      await client.getDialogs({ limit: 500 });
+      this.logger.log('Dialog cache muvaffaqiyatli yuklandi');
     } catch (error: unknown) {
       this.logger.warn(
         `Dialog cache yuklanmadi: ${this.getErrorMessage(error)}`,
@@ -100,6 +102,7 @@ export class ForwarderService implements OnModuleInit {
     await this.resolveDestinationPeer();
     await this.resolveSourceChannelNames();
 
+    // Barcha xabar turlarini eshitish uchun
     client.addEventHandler(this.onNewMessageEvent, new NewMessage({}));
 
     this.logger.log('Forwarder tayyor — yangi postlarni kutmoqda...');
@@ -117,7 +120,10 @@ export class ForwarderService implements OnModuleInit {
     for (const channelId of this.sourceChannelIds) {
       const resolveRef = `-100${channelId}`;
       try {
-        // GetFullChannel → entity cache ga tushadi, keyingi resolve lar ishlaydi
+        // Avval getEntity orqali entity ni olish
+        const entity = await client.getEntity(resolveRef);
+
+        // Keyin GetFullChannel orqali to'liq ma'lumot olish
         const fullChannel = await client.invoke(
           new Api.channels.GetFullChannel({
             channel: resolveRef,
@@ -128,15 +134,17 @@ export class ForwarderService implements OnModuleInit {
         const name =
           chat instanceof Api.Channel || chat instanceof Api.Chat
             ? chat.title
-            : "Noma'lum";
+            : entity instanceof Api.Channel || entity instanceof Api.Chat
+              ? entity.title
+              : "Noma'lum";
 
-        this.logger.log(`  ✓ ${name} (ID: ${channelId})`);
+        this.logger.log(`  ✓ ${name} (ID: ${channelId}, ref: ${resolveRef})`);
       } catch (error: unknown) {
         this.logger.warn(
-          `  ✗ ID: ${channelId} — resolve bo'lmadi: ${this.getErrorMessage(error)}`,
+          `  ✗ ID: ${channelId} (ref: ${resolveRef}) — resolve bo'lmadi: ${this.getErrorMessage(error)}`,
         );
         this.logger.warn(
-          `    Maslahat: .env da ID o'rniga @username ishlating`,
+          `    Maslahat: Kanal private bo'lsa, avval shu akkaunt bilan kanalga kiring`,
         );
       }
     }
@@ -147,13 +155,29 @@ export class ForwarderService implements OnModuleInit {
 
   private async handleNewMessage(event: NewMessageEvent): Promise<void> {
     const { message } = event;
-    // console.log(message);
+
     if (!(message instanceof Api.Message) || !message.peerId) {
       return;
     }
 
     const sourceChannelId = this.extractComparableChannelId(message.peerId);
-    if (!sourceChannelId || !this.sourceChannelIds.includes(sourceChannelId)) {
+
+    // Debug log - xabar qaysi kanaldan kelganini ko'rish uchun
+    this.logger.debug(
+      `Yangi xabar: kanal ID=${sourceChannelId}, xabar ID=${message.id}`,
+    );
+
+    if (!sourceChannelId) {
+      this.logger.warn(
+        `Channel ID aniqlanmadi: peerId type=${message.peerId.constructor.name}`,
+      );
+      return;
+    }
+
+    if (!this.sourceChannelIds.includes(sourceChannelId)) {
+      this.logger.debug(
+        `Xabar o'tkazib yuborildi - kanal kuzatilmaydi: ${sourceChannelId}. Kuzatilayotganlar: [${this.sourceChannelIds.join(', ')}]`,
+      );
       return;
     }
 
@@ -163,6 +187,10 @@ export class ForwarderService implements OnModuleInit {
       );
       return;
     }
+
+    this.logger.log(
+      `Yangi xabar qabul qilindi: kanal=${sourceChannelId}, xabar=${message.id}`,
+    );
 
     if (message.groupedId) {
       this.bufferAlbumMessage(message, sourceChannelId);
@@ -608,28 +636,43 @@ export class ForwarderService implements OnModuleInit {
 
   private normalizeComparableChannelId(rawValue: string): string {
     const value = rawValue.trim();
-    const normalized = value.replace(/^-100/, '').replace(/^-/, '');
+
+    // -100 prefiksini olib tashlash
+    let normalized = value.replace(/^-100/, '');
+
+    // Oddiy - prefiksini olib tashlash
+    normalized = normalized.replace(/^-/, '');
 
     if (!/^\d+$/.test(normalized)) {
       throw new Error(`SOURCE_CHANNEL_IDS noto'g'ri: ${value}`);
     }
 
-    if (/^100\d+$/.test(value)) {
-      return value.slice(3);
-    }
+    this.logger.debug(`Channel ID normalizatsiya: ${value} -> ${normalized}`);
 
     return normalized;
   }
 
   private extractComparableChannelId(peerId: Api.TypePeer): string | null {
     if (peerId instanceof Api.PeerChannel) {
-      return peerId.channelId.toString();
+      const channelId = peerId.channelId.toString();
+      this.logger.debug(`PeerChannel aniqlandi: ${channelId}`);
+      return channelId;
     }
 
     if (peerId instanceof Api.PeerChat) {
-      return peerId.chatId.toString();
+      const chatId = peerId.chatId.toString();
+      this.logger.debug(`PeerChat aniqlandi: ${chatId}`);
+      return chatId;
     }
 
+    if (peerId instanceof Api.PeerUser) {
+      this.logger.debug("PeerUser - o'tkazib yuborildi");
+      return null;
+    }
+
+    this.logger.warn(
+      `Noma'lum peer turi: ${(peerId as any).constructor?.name ?? 'Unknown'}`,
+    );
     return null;
   }
 
