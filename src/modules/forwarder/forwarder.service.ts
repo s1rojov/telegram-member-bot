@@ -116,7 +116,9 @@ export class ForwarderService implements OnModuleInit {
     // Polling mexanizmini ishga tushirish
     this.startPolling();
 
-    this.logger.log('Forwarder tayyor — yangi postlarni kutmoqda (event + polling)...');
+    this.logger.log(
+      'Forwarder tayyor — yangi postlarni kutmoqda (event + polling)...',
+    );
   }
 
   // ── Source kanallarni resolve qilib cache ga yuklaydi ───────────────────────
@@ -178,25 +180,33 @@ export class ForwarderService implements OnModuleInit {
         // Oxirgi xabarni olish
         const messages = await client.getMessages(entity, { limit: 1 });
 
-        if (messages && messages.length > 0 && messages[0] instanceof Api.Message) {
+        if (
+          messages &&
+          messages.length > 0 &&
+          messages[0] instanceof Api.Message
+        ) {
           const lastMessageId = messages[0].id;
           this.lastCheckedMessageIds.set(channelId, lastMessageId);
-          this.logger.log(`  ✓ Kanal ${channelId}: oxirgi xabar ID = ${lastMessageId}`);
+          this.logger.log(
+            ` ✓ Kanal ${channelId}: oxirgi xabar ID = ${lastMessageId}`,
+          );
         }
       } catch (error: unknown) {
         this.logger.warn(
-          `  ✗ Kanal ${channelId}: oxirgi xabar ID olinmadi: ${this.getErrorMessage(error)}`
+          `✗ Kanal ${channelId}: oxirgi xabar ID olinmadi: ${this.getErrorMessage(error)}`,
         );
       }
     }
 
-    this.logger.log('Boshlang\'ich holatni o\'rnatish tugadi');
+    this.logger.log("Boshlang'ich holatni o'rnatish tugadi");
   }
   // ────────────────────────────────────────────────────────────────────────────
 
   // ── Polling mexanizmi ───────────────────────────────────────────────────────
   private startPolling(): void {
-    this.logger.log(`Polling mexanizmi ishga tushirildi (interval: ${this.pollingIntervalMs / 1000}s)`);
+    this.logger.log(
+      `Polling mexanizmi ishga tushirildi (interval: ${this.pollingIntervalMs / 1000}s)`,
+    );
 
     // Dastlabki tekshiruv
     void this.pollChannels().catch((error: unknown) => {
@@ -231,12 +241,12 @@ export class ForwarderService implements OnModuleInit {
 
         // Yangi xabarlarni filtrlash
         const newMessages = messages.filter(
-          (msg) => msg instanceof Api.Message && msg.id > lastCheckedId
-        ) as Api.Message[];
+          (msg) => msg instanceof Api.Message && msg.id > lastCheckedId,
+        ) as any[];
 
         if (newMessages.length > 0) {
           this.logger.log(
-            `Polling: ${newMessages.length} ta yangi xabar topildi — kanal: ${channelId}`
+            `Polling: ${newMessages.length} ta yangi xabar topildi — kanal: ${channelId}`,
           );
 
           // Eng yangi message ID ni saqlash
@@ -263,7 +273,8 @@ export class ForwarderService implements OnModuleInit {
           // Oxirgi message ID ni yangilash (agar yangi xabar bo'lmasa ham)
           if (messages.length > 0 && messages[0] instanceof Api.Message) {
             const latestId = messages[0].id;
-            const currentLastChecked = this.lastCheckedMessageIds.get(channelId) || 0;
+            const currentLastChecked =
+              this.lastCheckedMessageIds.get(channelId) || 0;
             if (latestId > currentLastChecked) {
               this.lastCheckedMessageIds.set(channelId, latestId);
             }
@@ -271,7 +282,7 @@ export class ForwarderService implements OnModuleInit {
         }
       } catch (error: unknown) {
         this.logger.warn(
-          `Polling xatosi — kanal: ${channelId}: ${this.getErrorMessage(error)}`
+          `Polling xatosi — kanal: ${channelId}: ${this.getErrorMessage(error)}`,
         );
       }
     }
@@ -281,7 +292,7 @@ export class ForwarderService implements OnModuleInit {
     if (this.pollingTimer) {
       clearInterval(this.pollingTimer);
       this.pollingTimer = null;
-      this.logger.log('Polling mexanizmi to\'xtatildi');
+      this.logger.log("Polling mexanizmi to'xtatildi");
     }
   }
   // ────────────────────────────────────────────────────────────────────────────
@@ -322,7 +333,8 @@ export class ForwarderService implements OnModuleInit {
     }
 
     // Oxirgi tekshirilgan message ID ni yangilash
-    const currentLastChecked = this.lastCheckedMessageIds.get(sourceChannelId) || 0;
+    const currentLastChecked =
+      this.lastCheckedMessageIds.get(sourceChannelId) || 0;
     if (message.id > currentLastChecked) {
       this.lastCheckedMessageIds.set(sourceChannelId, message.id);
     }
