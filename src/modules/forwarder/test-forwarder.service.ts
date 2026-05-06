@@ -15,7 +15,6 @@ export class TestForwarderService implements OnModuleInit {
   ) {}
 
   async onModuleInit(): Promise<void> {
-    // Asosiy ForwarderService init bo'lishini kutamiz
     await new Promise((resolve) => setTimeout(resolve, 3000));
     await this.runTest();
   }
