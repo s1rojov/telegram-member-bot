@@ -11,6 +11,7 @@ import { TelegramService } from '../telegram/telegram.service';
 type ForwardRecord = {
   sourceChannelId: string;
   sourceMessageId: number;
+  destinationChannelId: string;
   destinationMessageId: number | null;
   status: 'success' | 'failed';
   error?: string;
@@ -25,8 +26,8 @@ export class ForwarderService implements OnModuleInit {
   private readonly translateClient = 'gtx';
 
   private sourceChannelIds: string[] = [];
-  private destinationChannelRef = '';
-  private destinationPeer: Api.TypeInputPeer | null = null;
+  private destinationChannelRefs: string[] = [];
+  private destinationPeers = new Map<string, Api.TypeInputPeer>();
   private translateTo = 'uz';
   private readonly forwardedKeys = new Set<string>();
   private forwardHistory: ForwardRecord[] = [];
@@ -63,14 +64,18 @@ export class ForwarderService implements OnModuleInit {
 
     const rawSourceIds =
       this.configService.get<string>('SOURCE_CHANNEL_IDS') ?? '';
-    const rawDestId =
+
+    // Backward compatibility: support both singular and plural
+    const rawDestIds =
+      this.configService.get<string>('DESTINATION_CHANNEL_IDS') ??
       this.configService.get<string>('DESTINATION_CHANNEL_ID') ?? '';
+
     const rawTranslateTo =
       this.configService.get<string>('TRANSLATE_TO')?.trim() ?? '';
 
-    if (!rawSourceIds || !rawDestId) {
+    if (!rawSourceIds || !rawDestIds) {
       this.logger.error(
-        'SOURCE_CHANNEL_IDS yoki DESTINATION_CHANNEL_ID .env da topilmadi!',
+        'SOURCE_CHANNEL_IDS yoki DESTINATION_CHANNEL_IDS .env da topilmadi!',
       );
       return;
     }
@@ -79,7 +84,12 @@ export class ForwarderService implements OnModuleInit {
       this.translateTo = rawTranslateTo;
     }
 
-    this.destinationChannelRef = this.normalizeDestinationReference(rawDestId);
+    this.destinationChannelRefs = rawDestIds
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean)
+      .map((id) => this.normalizeDestinationReference(id));
+
     this.sourceChannelIds = rawSourceIds
       .split(',')
       .map((id) => id.trim())
@@ -89,7 +99,9 @@ export class ForwarderService implements OnModuleInit {
     this.logger.log(
       `Kuzatilayotgan kanal IDlari: ${this.sourceChannelIds.join(', ')}`,
     );
-    this.logger.log(`Maqsadli kanal: ${this.destinationChannelRef}`);
+    this.logger.log(
+      `Maqsadli kanallar (${this.destinationChannelRefs.length} ta): ${this.destinationChannelRefs.join(', ')}`,
+    );
     this.logger.log(`Tarjima tili: ${this.translateTo}`);
 
     const client = this.telegramService.getClient();
@@ -104,7 +116,7 @@ export class ForwarderService implements OnModuleInit {
       );
     }
 
-    await this.resolveDestinationPeer();
+    await this.resolveDestinationPeers();
     await this.resolveSourceChannelNames();
 
     // Har bir kanal uchun oxirgi xabar ID ni olish
@@ -257,8 +269,8 @@ export class ForwarderService implements OnModuleInit {
           const sortedMessages = [...newMessages].sort((a, b) => a.id - b.id);
 
           for (const message of sortedMessages) {
-            // Agar allaqachon forward qilingan bo'lsa, o'tkazib yuborish
-            if (this.isAlreadyForwarded(channelId, message.id)) {
+            // Agar allaqachon barcha maqsadlarga forward qilingan bo'lsa, o'tkazib yuborish
+            if (this.isAlreadyForwardedToAnyDestination(channelId, message.id)) {
               continue;
             }
 
@@ -325,7 +337,7 @@ export class ForwarderService implements OnModuleInit {
       return;
     }
 
-    if (this.isAlreadyForwarded(sourceChannelId, message.id)) {
+    if (this.isAlreadyForwardedToAnyDestination(sourceChannelId, message.id)) {
       this.logger.warn(
         `Takror xabar o'tkazib yuborildi: ${sourceChannelId}:${message.id}`,
       );
@@ -400,7 +412,7 @@ export class ForwarderService implements OnModuleInit {
           index === items.findIndex((item) => item.id === message.id),
       );
     const pendingMessages = messages.filter(
-      (message) => !this.isAlreadyForwarded(sourceChannelId, message.id),
+      (message) => !this.isAlreadyForwardedToAnyDestination(sourceChannelId, message.id),
     );
 
     if (pendingMessages.length === 0) {
@@ -420,72 +432,109 @@ export class ForwarderService implements OnModuleInit {
     sourceChannelId: string,
   ): Promise<void> {
     const pendingMessages = messages.filter(
-      (message) => !this.isAlreadyForwarded(sourceChannelId, message.id),
+      (message) => !this.isAlreadyForwardedToAnyDestination(sourceChannelId, message.id),
     );
 
     if (pendingMessages.length === 0) {
       return;
     }
 
-    if (!this.destinationPeer) {
-      await this.resolveDestinationPeer();
+    if (this.destinationPeers.size === 0) {
+      await this.resolveDestinationPeers();
     }
 
-    if (!this.destinationPeer) {
+    if (this.destinationPeers.size === 0) {
       const errorMessage =
-        'Maqsadli kanal resolve qilinmadi. Kanalni shu akkaunt bilan oching yoki public username ishlating.';
+        'Hech qanday maqsadli kanal resolve qilinmadi. Kanallarni shu akkaunt bilan oching yoki public username ishlating.';
       this.logger.error(errorMessage);
 
       for (const message of pendingMessages) {
-        this.recordForwardAttempt({
-          sourceChannelId,
-          sourceMessageId: message.id,
-          destinationMessageId: null,
-          status: 'failed',
-          error: errorMessage,
-          forwardedAt: new Date().toISOString(),
-        });
+        for (const destRef of this.destinationChannelRefs) {
+          const destId = this.extractChannelIdFromRef(destRef);
+          this.recordForwardAttempt({
+            sourceChannelId,
+            sourceMessageId: message.id,
+            destinationChannelId: destId,
+            destinationMessageId: null,
+            status: 'failed',
+            error: errorMessage,
+            forwardedAt: new Date().toISOString(),
+          });
+        }
       }
       return;
     }
 
     const messageIds = pendingMessages.map((message) => message.id);
     this.logger.log(
-      `Copy boshlanmoqda — kanal: ${sourceChannelId}, xabarlar: ${messageIds.join(', ')}`,
+      `Copy boshlanmoqda — kanal: ${sourceChannelId}, xabarlar: ${messageIds.join(', ')} → ${this.destinationPeers.size} ta maqsadga`,
     );
 
-    try {
-      const result = await this.sendMessagesAsCopies(pendingMessages);
+    let successCount = 0;
+    let failCount = 0;
 
-      const sentMessages = this.normalizeForwardResult(result);
+    for (const [destId, destPeer] of this.destinationPeers.entries()) {
+      // Filter messages not yet forwarded to this specific destination
+      const messagesToForward = pendingMessages.filter(
+        (message) => !this.isAlreadyForwarded(sourceChannelId, message.id, destId),
+      );
 
-      for (let i = 0; i < messageIds.length; i++) {
-        const sentMessage = sentMessages[i];
-        this.recordForwardAttempt({
-          sourceChannelId,
-          sourceMessageId: messageIds[i],
-          destinationMessageId: sentMessage?.id ?? null,
-          status: 'success',
-          forwardedAt: new Date().toISOString(),
-        });
+      if (messagesToForward.length === 0) {
+        this.logger.debug(
+          `Barcha xabarlar allaqachon ${destId} ga yuborilgan, o'tkazib yuborildi`,
+        );
+        continue;
       }
 
-      this.logger.log(
-        `✓ ${messageIds.length} ta xabar muvaffaqiyatli yuborildi`,
-      );
-    } catch (error: any) {
-      await this.handleForwardError(error, pendingMessages, sourceChannelId);
+      try {
+        const result = await this.sendMessagesAsCopies(messagesToForward, destPeer);
+        const sentMessages = this.normalizeForwardResult(result);
+
+        for (let i = 0; i < messagesToForward.length; i++) {
+          const sentMessage = sentMessages[i];
+          this.recordForwardAttempt({
+            sourceChannelId,
+            sourceMessageId: messagesToForward[i].id,
+            destinationChannelId: destId,
+            destinationMessageId: sentMessage?.id ?? null,
+            status: 'success',
+            forwardedAt: new Date().toISOString(),
+          });
+        }
+
+        successCount++;
+        this.logger.log(
+          `  ✓ Maqsad ${successCount}/${this.destinationPeers.size}: ${messagesToForward.length} ta xabar yuborildi (dest: ${destId})`,
+        );
+      } catch (error: any) {
+        failCount++;
+        await this.handleForwardError(error, messagesToForward, sourceChannelId, destId);
+      }
     }
+
+    this.logger.log(
+      `✓ Forward tugadi: ${successCount} muvaffaqiyatli, ${failCount} xato`,
+    );
+  }
+
+  private isAlreadyForwardedToAnyDestination(
+    sourceChannelId: string,
+    sourceMessageId: number,
+  ): boolean {
+    // Check if forwarded to ALL destinations
+    for (const [destId] of this.destinationPeers.entries()) {
+      if (!this.isAlreadyForwarded(sourceChannelId, sourceMessageId, destId)) {
+        return false;
+      }
+    }
+    return this.destinationPeers.size > 0;
   }
 
   private async sendMessagesAsCopies(
     messages: Api.Message[],
+    destinationPeer: Api.TypeInputPeer,
   ): Promise<Api.Message | Array<Api.Message | undefined>> {
     const client = this.telegramService.getClient();
-
-    if (!this.destinationPeer) {
-      throw new Error('Destination peer topilmadi');
-    }
 
     if (messages.length > 1 && messages.every((message) => message.media)) {
       const translatedCaptions = await Promise.all(
@@ -500,7 +549,7 @@ export class ForwarderService implements OnModuleInit {
       this.logger.log(
         `Album fresh-upload rejimida yuborilmoqda: ${messages.length} ta`,
       );
-      const result = await client.sendFile(this.destinationPeer, {
+      const result = await client.sendFile(destinationPeer, {
         file: uploadFiles,
         caption: translatedCaptions,
         parseMode: false,
@@ -511,7 +560,7 @@ export class ForwarderService implements OnModuleInit {
     }
 
     const sentMessages = await Promise.all(
-      messages.map((message) => this.sendSingleMessageAsCopy(message)),
+      messages.map((message) => this.sendSingleMessageAsCopy(message, destinationPeer)),
     );
 
     return sentMessages;
@@ -519,12 +568,9 @@ export class ForwarderService implements OnModuleInit {
 
   private async sendSingleMessageAsCopy(
     message: Api.Message,
+    destinationPeer: Api.TypeInputPeer,
   ): Promise<Api.Message> {
     const client = this.telegramService.getClient();
-
-    if (!this.destinationPeer) {
-      throw new Error('Destination peer topilmadi');
-    }
 
     const translatedText = await this.translateText(
       message.message ?? '',
@@ -534,7 +580,7 @@ export class ForwarderService implements OnModuleInit {
     if (message.media && !(message.media instanceof Api.MessageMediaWebPage)) {
       const uploadFile = await this.downloadMediaAsUploadFile(message);
 
-      return client.sendFile(this.destinationPeer, {
+      return client.sendFile(destinationPeer, {
         file: uploadFile,
         caption: translatedText,
         parseMode: false,
@@ -544,7 +590,7 @@ export class ForwarderService implements OnModuleInit {
 
     const textToSend = translatedText || message.message || ' ';
 
-    return client.sendMessage(this.destinationPeer, {
+    return client.sendMessage(destinationPeer, {
       message: textToSend,
       parseMode: false,
       linkPreview: message.media instanceof Api.MessageMediaWebPage,
@@ -598,13 +644,13 @@ export class ForwarderService implements OnModuleInit {
     sourceMessageId: number,
   ): Promise<string> {
     if (!text.trim()) {
-      return text;
+      return this.addChannelSignature('');
     }
 
     const cleanOriginalText = this.removeChannelLinks(text);
 
     if (!cleanOriginalText.trim()) {
-      return '';
+      return this.addChannelSignature('');
     }
 
     this.logger.log(
@@ -624,30 +670,41 @@ export class ForwarderService implements OnModuleInit {
         !('text' in result) ||
         typeof result.text !== 'string'
       ) {
-        return cleanOriginalText;
+        return this.addChannelSignature(cleanOriginalText);
       }
 
       const translatedText = result.text.trim();
       if (!translatedText) {
-        return cleanOriginalText;
+        return this.addChannelSignature(cleanOriginalText);
       }
 
       const finalResult = this.removeChannelLinks(translatedText);
 
       this.logger.log(`Tarjima tayyor — xabar ID: ${sourceMessageId}`);
-      return finalResult;
+      return this.addChannelSignature(finalResult);
     } catch (error: unknown) {
       this.logger.warn(
         `Tarjima xatosi — xabar ID: ${sourceMessageId}: ${this.getErrorMessage(error)}`,
       );
-      return cleanOriginalText;
+      return this.addChannelSignature(cleanOriginalText);
     }
+  }
+
+  private addChannelSignature(text: string): string {
+    const signature = '\n\n@WatcherGuruUzb';
+
+    if (!text || !text.trim()) {
+      return signature.trim();
+    }
+
+    return text + signature;
   }
 
   private async handleForwardError(
     error: any,
     messages: Api.Message[],
     sourceChannelId: string,
+    destinationChannelId: string,
   ): Promise<void> {
     const errorName: string = error?.constructor?.name ?? 'UnknownError';
     const errorMessage = this.getErrorMessage(error);
@@ -661,11 +718,48 @@ export class ForwarderService implements OnModuleInit {
       );
 
       this.logger.log('FloodWait tugadi. Qayta urinilmoqda...');
-      await this.forwardMessages(messages, sourceChannelId);
+
+      // Retry for this specific destination
+      const destPeer = this.destinationPeers.get(destinationChannelId);
+      if (destPeer) {
+        try {
+          const result = await this.sendMessagesAsCopies(messages, destPeer);
+          const sentMessages = this.normalizeForwardResult(result);
+
+          for (let i = 0; i < messages.length; i++) {
+            const sentMessage = sentMessages[i];
+            this.recordForwardAttempt({
+              sourceChannelId,
+              sourceMessageId: messages[i].id,
+              destinationChannelId,
+              destinationMessageId: sentMessage?.id ?? null,
+              status: 'success',
+              forwardedAt: new Date().toISOString(),
+            });
+          }
+        } catch (retryError: any) {
+          this.logger.error(
+            `Qayta urinishda xato (dest: ${destinationChannelId}): ${this.getErrorMessage(retryError)}`,
+          );
+          for (const message of messages) {
+            this.recordForwardAttempt({
+              sourceChannelId,
+              sourceMessageId: message.id,
+              destinationChannelId,
+              destinationMessageId: null,
+              status: 'failed',
+              error: `${errorName}: ${errorMessage}`.slice(0, 500),
+              forwardedAt: new Date().toISOString(),
+            });
+          }
+        }
+      }
       return;
     }
 
-    this.logger.error(`Xabar yuborishda xato [${errorName}]: ${errorMessage}`);
+    this.logger.error(
+      `Xabar yuborishda xato (dest: ${destinationChannelId}) [${errorName}]: ${errorMessage}`,
+    );
 
     const hint = this.buildErrorHint(errorMessage);
     if (hint) {
@@ -676,6 +770,7 @@ export class ForwarderService implements OnModuleInit {
       this.recordForwardAttempt({
         sourceChannelId,
         sourceMessageId: message.id,
+        destinationChannelId,
         destinationMessageId: null,
         status: 'failed',
         error: `${errorName}: ${errorMessage}`.slice(0, 500),
@@ -684,28 +779,63 @@ export class ForwarderService implements OnModuleInit {
     }
   }
 
-  private async resolveDestinationPeer(): Promise<void> {
+  private async resolveDestinationPeers(): Promise<void> {
     const client = this.telegramService.getClient();
 
-    try {
-      this.destinationPeer = await client.getInputEntity(
-        this.destinationChannelRef,
-      );
-      const destinationEntity = await client.getEntity(this.destinationPeer);
-      this.logger.log(
-        `Maqsadli kanal: ${this.describeEntity(destinationEntity)}`,
-      );
-    } catch (error: unknown) {
-      this.destinationPeer = null;
-      this.logger.error(
-        `Maqsadli kanal resolve bo'lmadi (${this.destinationChannelRef}): ${this.getErrorMessage(error)}`,
-      );
+    this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    this.logger.log(
+      `Maqsadli kanallar (${this.destinationChannelRefs.length} ta):`,
+    );
 
-      const hint = this.buildErrorHint(this.getErrorMessage(error));
-      if (hint) {
-        this.logger.error(`Yechim: ${hint}`);
+    for (const destRef of this.destinationChannelRefs) {
+      try {
+        const peer = await client.getInputEntity(destRef);
+        const entity = await client.getEntity(peer);
+
+        // Extract channel ID for the Map key
+        const channelId = this.extractChannelIdFromRef(destRef);
+        this.destinationPeers.set(channelId, peer);
+
+        this.logger.log(
+          `  ✓ ${this.describeEntity(entity)} (ref: ${destRef})`,
+        );
+      } catch (error: unknown) {
+        this.logger.error(
+          `  ✗ Maqsadli kanal resolve bo'lmadi (${destRef}): ${this.getErrorMessage(error)}`,
+        );
+
+        const hint = this.buildErrorHint(this.getErrorMessage(error));
+        if (hint) {
+          this.logger.error(`    Yechim: ${hint}`);
+        }
       }
     }
+
+    this.logger.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+    if (this.destinationPeers.size === 0) {
+      this.logger.error(
+        'Hech qanday maqsadli kanal resolve qilinmadi! Botni to\'xtatish kerak.',
+      );
+    } else {
+      this.logger.log(
+        `${this.destinationPeers.size}/${this.destinationChannelRefs.length} ta maqsadli kanal tayyor`,
+      );
+    }
+  }
+
+  private extractChannelIdFromRef(ref: string): string {
+    // Extract a comparable ID from the reference for use as Map key
+    if (ref.startsWith('-100')) {
+      return ref.substring(4); // Remove -100 prefix
+    }
+    if (ref.startsWith('-')) {
+      return ref.substring(1); // Remove - prefix
+    }
+    if (ref.startsWith('@') || ref.includes('t.me/')) {
+      return ref; // Use username/link as-is
+    }
+    return ref;
   }
 
   private loadForwardHistory(): void {
@@ -720,8 +850,10 @@ export class ForwarderService implements OnModuleInit {
 
       for (const entry of this.forwardHistory) {
         if (entry.status === 'success') {
+          // Handle both old format (without destinationChannelId) and new format
+          const destId = entry.destinationChannelId || 'legacy';
           this.forwardedKeys.add(
-            this.makeForwardKey(entry.sourceChannelId, entry.sourceMessageId),
+            this.makeForwardKey(entry.sourceChannelId, entry.sourceMessageId, destId),
           );
         }
       }
@@ -743,7 +875,7 @@ export class ForwarderService implements OnModuleInit {
 
     if (record.status === 'success') {
       this.forwardedKeys.add(
-        this.makeForwardKey(record.sourceChannelId, record.sourceMessageId),
+        this.makeForwardKey(record.sourceChannelId, record.sourceMessageId, record.destinationChannelId),
       );
     }
 
@@ -830,17 +962,19 @@ export class ForwarderService implements OnModuleInit {
   private isAlreadyForwarded(
     sourceChannelId: string,
     sourceMessageId: number,
+    destinationChannelId: string,
   ): boolean {
     return this.forwardedKeys.has(
-      this.makeForwardKey(sourceChannelId, sourceMessageId),
+      this.makeForwardKey(sourceChannelId, sourceMessageId, destinationChannelId),
     );
   }
 
   private makeForwardKey(
     sourceChannelId: string,
     sourceMessageId: number,
+    destinationChannelId: string,
   ): string {
-    return `${sourceChannelId}:${sourceMessageId}`;
+    return `${sourceChannelId}:${sourceMessageId}:${destinationChannelId}`;
   }
 
   private normalizeForwardResult(

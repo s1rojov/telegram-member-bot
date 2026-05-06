@@ -1,0 +1,50 @@
+[
+  {
+    "sourceChannelId": "1271365654",
+    "sourceMessageId": 379,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1325,
+    "status": "success",
+    "forwardedAt": "2026-05-06T07:24:54.608Z"
+  },
+  {
+    "sourceChannelId": "1271365654",
+    "sourceMessageId": 380,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1326,
+    "status": "success",
+    "forwardedAt": "2026-05-06T07:25:36.508Z"
+  },
+  {
+    "sourceChannelId": "1556054753",
+    "sourceMessageId": 13527,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1327,
+    "status": "success",
+    "forwardedAt": "2026-05-06T07:41:42.920Z"
+  },
+  {
+    "sourceChannelId": "1462219382",
+    "sourceMessageId": 28907,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1328,
+    "status": "success",
+    "forwardedAt": "2026-05-06T08:09:45.284Z"
+  },
+  {
+    "sourceChannelId": "1462219382",
+    "sourceMessageId": 28908,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1329,
+    "status": "success",
+    "forwardedAt": "2026-05-06T09:02:48.747Z"
+  },
+  {
+    "sourceChannelId": "1462219382",
+    "sourceMessageId": 28909,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1330,
+    "status": "success",
+    "forwardedAt": "2026-05-06T09:46:45.697Z"
+  }
+]
