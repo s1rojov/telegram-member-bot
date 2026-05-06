@@ -536,34 +536,54 @@ export class ForwarderService implements OnModuleInit {
   ): Promise<Api.Message | Array<Api.Message | undefined>> {
     const client = this.telegramService.getClient();
 
-    if (messages.length > 1 && messages.every((message) => message.media)) {
+    // Separate media messages from text-only messages
+    const mediaMessages = messages.filter((msg) => msg.media && !(msg.media instanceof Api.MessageMediaWebPage));
+    const textOnlyMessages = messages.filter((msg) => !msg.media || msg.media instanceof Api.MessageMediaWebPage);
+
+    const results: Array<Api.Message | undefined> = [];
+
+    // Send album (multiple media messages together)
+    if (mediaMessages.length > 1) {
       const translatedCaptions = await Promise.all(
-        messages.map((message) =>
-          this.translateText(message.message ?? '', message.id),
-        ),
+        mediaMessages.map(async (message, index) => {
+          const translated = await this.translateText(message.message ?? '', message.id);
+          // Only add signature to the first media message (which has the main caption)
+          if (index === 0) {
+            return translated; // Signature already added by translateText
+          }
+          // For other media in album, don't add signature (they usually have empty captions)
+          return message.message ? translated : '';
+        }),
       );
       const uploadFiles = await Promise.all(
-        messages.map((message) => this.downloadMediaAsUploadFile(message)),
+        mediaMessages.map((message) => this.downloadMediaAsUploadFile(message)),
       );
 
       this.logger.log(
-        `Album fresh-upload rejimida yuborilmoqda: ${messages.length} ta`,
+        `Album fresh-upload rejimida yuborilmoqda: ${mediaMessages.length} ta media`,
       );
-      const result = await client.sendFile(destinationPeer, {
+      const albumResult = await client.sendFile(destinationPeer, {
         file: uploadFiles,
         caption: translatedCaptions,
         parseMode: false,
-        silent: messages[0].silent,
+        silent: mediaMessages[0].silent,
       });
 
-      return this.normalizeForwardResult(result);
+      const normalizedAlbum = this.normalizeForwardResult(albumResult);
+      results.push(...normalizedAlbum);
+    } else if (mediaMessages.length === 1) {
+      // Send single media message
+      const sentMedia = await this.sendSingleMessageAsCopy(mediaMessages[0], destinationPeer);
+      results.push(sentMedia);
     }
 
-    const sentMessages = await Promise.all(
-      messages.map((message) => this.sendSingleMessageAsCopy(message, destinationPeer)),
-    );
+    // Send text-only messages separately
+    for (const textMessage of textOnlyMessages) {
+      const sentText = await this.sendSingleMessageAsCopy(textMessage, destinationPeer);
+      results.push(sentText);
+    }
 
-    return sentMessages;
+    return results;
   }
 
   private async sendSingleMessageAsCopy(
