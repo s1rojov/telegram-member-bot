@@ -24,6 +24,7 @@ export class ForwarderService implements OnModuleInit {
   private readonly albumFlushDelayMs = 1200;
   private readonly logFilePath: string;
   private readonly translateClient = 'gtx';
+  private readonly MAX_CAPTION_LENGTH = 1024;
 
   private sourceChannelIds: string[] = [];
   private destinationChannelRefs: string[] = [];
@@ -549,10 +550,10 @@ export class ForwarderService implements OnModuleInit {
           const translated = await this.translateText(message.message ?? '', message.id);
           // Only add signature to the first media message (which has the main caption)
           if (index === 0) {
-            return translated; // Signature already added by translateText
+            return this.truncateCaptionIfNeeded(translated); // Signature already added by translateText
           }
           // For other media in album, don't add signature (they usually have empty captions)
-          return message.message ? translated : '';
+          return message.message ? this.truncateCaptionIfNeeded(translated) : '';
         }),
       );
       const uploadFiles = await Promise.all(
@@ -602,7 +603,7 @@ export class ForwarderService implements OnModuleInit {
 
       return client.sendFile(destinationPeer, {
         file: uploadFile,
-        caption: translatedText,
+        caption: this.truncateCaptionIfNeeded(translatedText),
         parseMode: false,
         silent: message.silent,
       });
@@ -718,6 +719,30 @@ export class ForwarderService implements OnModuleInit {
     }
 
     return text + signature;
+  }
+
+  private truncateCaptionIfNeeded(caption: string): string {
+    if (caption.length <= this.MAX_CAPTION_LENGTH) {
+      return caption;
+    }
+
+    const signature = '\n\n@WatcherGuruUzb';
+    const ellipsis = '...';
+    const maxTextLength = this.MAX_CAPTION_LENGTH - signature.length - ellipsis.length;
+
+    if (maxTextLength <= 0) {
+      // If signature itself is too long, just return truncated signature
+      return signature.substring(0, this.MAX_CAPTION_LENGTH);
+    }
+
+    const truncatedText = caption.substring(0, maxTextLength);
+    const result = truncatedText + ellipsis + signature;
+
+    this.logger.warn(
+      `Caption qisqartirildi: ${caption.length} → ${result.length} belgi`,
+    );
+
+    return result;
   }
 
   private async handleForwardError(

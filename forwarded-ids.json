@@ -62,5 +62,21 @@
     "destinationMessageId": 1332,
     "status": "success",
     "forwardedAt": "2026-05-06T11:03:55.770Z"
+  },
+  {
+    "sourceChannelId": "1271365654",
+    "sourceMessageId": 382,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1333,
+    "status": "success",
+    "forwardedAt": "2026-05-07T12:16:34.174Z"
+  },
+  {
+    "sourceChannelId": "1271365654",
+    "sourceMessageId": 383,
+    "destinationChannelId": "1735450583",
+    "destinationMessageId": 1334,
+    "status": "success",
+    "forwardedAt": "2026-05-07T12:56:53.808Z"
   }
 ]
